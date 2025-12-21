@@ -33,8 +33,10 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/time.h>
 #include "server.h"
 #include "sblist.h"
+#define MICROSOCKS_VERSION "1.0.5-chain"
 
 /* timeout in microseconds on resource exhaustion to prevent excessive
    cpu usage. */
@@ -71,6 +73,7 @@ static sblist* auth_ips;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
 static union sockaddr_union bind_addr = {.v4.sin_family = AF_UNSPEC};
+static char *upstream_socks = NULL;
 
 enum socksstate {
 	SS_1_CONNECTED,
@@ -125,7 +128,251 @@ static struct addrinfo* addr_choose(struct addrinfo* list, union sockaddr_union*
 	return list;
 }
 
+// 支持认证的上游代理转发
+static int simple_upstream_proxy(unsigned char *buf, size_t n, struct client *client) {
+	// 验证SOCKS5请求
+	if (n < 5 || buf[0] != 5 || buf[1] != 1 || buf[2] != 0) {
+		return -EC_GENERAL_FAILURE;
+	}
+
+	// 解析上游代理配置
+	char host[256] = {0};
+	char user[256] = {0};
+	char pass[256] = {0};
+	int port = 1070;
+
+	const char *p = upstream_socks;
+	const char *at = strchr(p, '@');
+
+	if (at) {
+		// 格式: user:pass@host:port
+		const char *colon = strchr(p, ':');
+		if (colon && colon < at) {
+			size_t ulen = colon - p;
+			if (ulen < sizeof(user)) {
+				memcpy(user, p, ulen);
+				user[ulen] = 0;
+			}
+
+			size_t plen = at - colon - 1;
+			if (plen < sizeof(pass)) {
+				memcpy(pass, colon + 1, plen);
+				pass[plen] = 0;
+			}
+		}
+		p = at + 1;
+	}
+
+	const char *port_colon = strrchr(p, ':');
+	if (port_colon) {
+		size_t host_len = port_colon - p;
+		if (host_len < sizeof(host)) {
+			memcpy(host, p, host_len);
+			host[host_len] = 0;
+		}
+		port = atoi(port_colon + 1);
+	} else {
+		strncpy(host, p, sizeof(host)-1);
+		host[sizeof(host)-1] = 0;
+	}
+
+	// 连接上游代理
+	struct addrinfo hints = {0}, *res;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+
+	char port_str[16];
+	snprintf(port_str, sizeof(port_str), "%d", port);
+
+	if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+		return -EC_GENERAL_FAILURE;
+	}
+
+	int fd = socket(res->ai_family, SOCK_STREAM, 0);
+	if (fd < 0) {
+		freeaddrinfo(res);
+		return -EC_GENERAL_FAILURE;
+	}
+
+	// 设置超时
+	struct timeval tv;
+	tv.tv_sec = 5;
+	tv.tv_usec = 0;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+	
+	if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+		close(fd);
+		freeaddrinfo(res);
+		return -EC_CONN_REFUSED;
+	}
+	freeaddrinfo(res);
+
+	// SOCKS5握手
+	unsigned char hs_buf[512];
+
+	if (user[0] && pass[0]) {
+		// 支持两种认证方法
+		hs_buf[0] = 5;
+		hs_buf[1] = 2;
+		hs_buf[2] = 0; // NO_AUTH
+		hs_buf[3] = 2; // USERNAME/PASSWORD
+		if (write(fd, hs_buf, 4) != 4) {
+			close(fd);
+			return -EC_GENERAL_FAILURE;
+		}
+	} else {
+		// 只支持NO_AUTH
+		hs_buf[0] = 5;
+		hs_buf[1] = 1;
+		hs_buf[2] = 0; // NO_AUTH
+		if (write(fd, hs_buf, 3) != 3) {
+			close(fd);
+			return -EC_GENERAL_FAILURE;
+		}
+	}
+
+	// 读取方法选择
+	unsigned char reply[2];
+	if (read(fd, reply, 2) != 2 || reply[0] != 5) {
+		close(fd);
+		return -EC_GENERAL_FAILURE;
+	}
+
+	// 处理认证
+	if (reply[1] == 2) { // USERNAME/PASSWORD
+		if (!user[0] || !pass[0]) {
+			close(fd);
+			return -EC_NOT_ALLOWED;
+		}
+
+		size_t ulen = strlen(user);
+		size_t plen = strlen(pass);
+		hs_buf[0] = 1;
+		hs_buf[1] = ulen;
+		memcpy(hs_buf + 2, user, ulen);
+		hs_buf[2 + ulen] = plen;
+		memcpy(hs_buf + 3 + ulen, pass, plen);
+
+		if (write(fd, hs_buf, 3 + ulen + plen) != (ssize_t)(3 + ulen + plen)) {
+			close(fd);
+			return -EC_GENERAL_FAILURE;
+		}
+
+		if (read(fd, hs_buf, 2) != 2 || hs_buf[1] != 0) {
+			close(fd);
+			return -EC_NOT_ALLOWED;
+		}
+	} else if (reply[1] != 0) {
+		close(fd);
+		return -EC_NOT_ALLOWED;
+	}
+
+	// 转发CONNECT请求
+	if (write(fd, buf, n) != (ssize_t)n) {
+		close(fd);
+		return -EC_GENERAL_FAILURE;
+	}
+
+	// 读取上游响应并转发给客户端
+	unsigned char resp[256];
+	ssize_t total = 0;
+
+	// 读取响应头
+	while (total < 4) {
+		ssize_t r = read(fd, resp + total, 4 - total);
+		if (r <= 0) {
+			close(fd);
+			return -EC_GENERAL_FAILURE;
+		}
+		total += r;
+	}
+
+	// 检查响应状态
+	if (resp[1] != 0) {
+		close(fd);
+		return -resp[1]; // 返回上游的错误码
+	}
+
+	// 根据ATYP确定还需要读多少
+	int need_more = 0;
+	switch (resp[3]) {
+		case 1: // IPv4
+			need_more = 4 + 2;
+			break;
+		case 4: // IPv6
+			need_more = 16 + 2;
+			break;
+		case 3: // 域名
+			// 读域名长度
+			ssize_t r = read(fd, resp + total, 1);
+			if (r != 1) {
+				close(fd);
+				return -EC_GENERAL_FAILURE;
+			}
+			total += r;
+			need_more = resp[4] + 2;
+			break;
+		default:
+			close(fd);
+			return -EC_ADDRESSTYPE_NOT_SUPPORTED;
+	}
+
+	// 读剩余部分
+	while (total < 4 + need_more) {
+		ssize_t r = read(fd, resp + total, (4 + need_more) - total);
+		if (r <= 0) {
+			close(fd);
+			return -EC_GENERAL_FAILURE;
+		}
+		total += r;
+	}
+
+	// 转发给客户端
+	if (write(client->fd, resp, total) != total) {
+		close(fd);
+		return -EC_GENERAL_FAILURE;
+	}
+
+	if(CONFIG_LOG) {
+		char clientname[256];
+		int af = SOCKADDR_UNION_AF(&client->addr);
+		void *ipdata = SOCKADDR_UNION_ADDRESS(&client->addr);
+		inet_ntop(af, ipdata, clientname, sizeof clientname);
+		char target[256] = {0};
+		unsigned short target_port = 0;
+		if (buf[3] == 1) { // IPv4
+			inet_ntop(AF_INET, buf+4, target, sizeof target);
+			target_port = (buf[8] << 8) | buf[9];
+		} else if (buf[3] == 4) { // IPv6
+			inet_ntop(AF_INET6, buf+4, target, sizeof target);
+			target_port = (buf[20] << 8) | buf[21];
+		} else if (buf[3] == 3) { // 域名
+			int domain_len = buf[4];
+			if (domain_len < sizeof(target)-1) {
+				memcpy(target, buf+5, domain_len);
+				target[domain_len] = 0;
+				target_port = (buf[5+domain_len] << 8) | buf[6+domain_len];
+			}
+		}
+		if (target[0]) {
+			dolog("client[%d] %s: forwarded to upstream %s -> %s:%d\n", 
+				  client->fd, clientname, upstream_socks, target, target_port);
+		} else {
+			dolog("client[%d] %s: forwarded to upstream %s\n", 
+				  client->fd, clientname, upstream_socks);
+		}
+	}
+
+	return fd;
+}
+
 static int connect_socks_target(unsigned char *buf, size_t n, struct client *client) {
+	// 外挂：如果有上游代理配置，走上游（SOCKS5）
+	if (upstream_socks && upstream_socks[0]) {
+		return simple_upstream_proxy(buf, n, client);
+	}
+
 	if(n < 5) return -EC_GENERAL_FAILURE;
 	if(buf[0] != 5) return -EC_GENERAL_FAILURE;
 	if(buf[1] != 1) return -EC_COMMAND_NOT_SUPPORTED; /* we support only CONNECT method */
@@ -350,7 +597,10 @@ static int handshake(struct thread *t) {
 					send_error(t->client.fd, ret*-1);
 					return -1;
 				}
-				send_error(t->client.fd, EC_SUCCESS);
+				// 上游代理模式已经在 simple_upstream_proxy 中发送了响应
+				if (!upstream_socks || !upstream_socks[0]) {
+					send_error(t->client.fd, EC_SUCCESS);
+				}
 				return ret;
 		}
 	}
@@ -401,6 +651,11 @@ static int usage(void) {
 		" this is handy for programs like firefox that don't support\n"
 		" user/pass auth. for it to work you'd basically make one connection\n"
 		" with another program that supports it, and then you can use firefox too.\n"
+		"option -s upstream SOCKS5 proxy (format: [user:pass@]host:port)\n"
+		" when set, all connections are forwarded to the upstream proxy\n"
+		" example: -s 127.0.0.1:1070\n"
+		"          -s admin:password@proxy.example.com:1070\n"
+		"option -V prints version information and exits.\n"
 	);
 	return 1;
 }
@@ -416,7 +671,7 @@ int main(int argc, char** argv) {
 	const char *listenip = "0.0.0.0";
 	char *p, *q;
 	unsigned port = 1080;
-	while((ch = getopt(argc, argv, ":1qb:i:p:u:P:w:")) != -1) {
+	while((ch = getopt(argc, argv, ":1qb:i:p:u:P:w:s:V")) != -1) {
 		switch(ch) {
 			case 'w': /* fall-through */
 			case '1':
@@ -456,11 +711,18 @@ int main(int argc, char** argv) {
 			case 'p':
 				port = atoi(optarg);
 				break;
+			case 's':
+				upstream_socks = strdup(optarg);
+				zero_arg(optarg);
+				break;
 			case ':':
 				dprintf(2, "error: option -%c requires an operand\n", optopt);
 				/* fall through */
 			case '?':
 				return usage();
+			case 'V':
+				dprintf(1, "MicroSocks %s\n", MICROSOCKS_VERSION);
+				return 0;
 		}
 	}
 	if((auth_user && !auth_pass) || (!auth_user && auth_pass)) {
