@@ -566,50 +566,85 @@ static int fwd_rules_add(char *str) {
 	upstream_port = host_get_port(upstream);
 	remote_port = host_get_port(remote);
 
-	if(match_port < 0 || upstream_port <= 0 || remote_port < 0)
-		return 1;
-
-	if(strcmp(match, "0.0.0.0") == 0 || strcmp(match, "*") == 0) {
+	if(match_port < 0 || upstream_port <= 0 || remote_port < 0) {
 		free(match);
-		match = strdup("");
+		free(upstream);
+		free(remote);
+		return 1;
 	}
 
+	char *match_copy = strdup(match);
+	char *upstream_copy = strdup(upstream);
+	char *remote_copy = strdup(remote);
+
 	struct fwd_rule *rule = (struct fwd_rule*)malloc(sizeof(struct fwd_rule));
-	if (!rule) return 1;
-	rule->match_name = match;
+	if (!rule) {
+		free(match_copy);
+		free(upstream_copy);
+		free(remote_copy);
+		free(match);
+		free(upstream);
+		free(remote);
+		return 1;
+	}
+
+	if(strcmp(match_copy, "0.0.0.0") == 0 || strcmp(match_copy, "*") == 0) {
+		free(match_copy);
+		rule->match_name = strdup("");
+	} else {
+		rule->match_name = match_copy;
+	}
 	rule->match_port = match_port;
 	rule->auth_buf = NULL;
 	rule->auth_len = 0;
-	char *upstream_copy = strdup(upstream);
-	rule->upstream_name = upstream_copy;
-	rule->upstream_port = upstream_port;
 
-	char* p, *q;
-	p = strchr(upstream_copy, '@');
-	q = strrchr(upstream_copy, ':');
-	if(p && q && p < q) {
-		*p++ = '\0';
-		*q++ = '\0';
-		size_t ulen = strlen(upstream_copy);
-		size_t plen = strlen(q);
+	char *at_sign = strchr(upstream_copy, '@');
+	if (at_sign) {
+		*at_sign = '\0';
+		char *auth_part = upstream_copy;
+		char *host_part = at_sign + 1;
+		char *colon = strchr(auth_part, ':');
+		if (!colon) {
+			free(rule);
+			free(upstream_copy);
+			free(remote_copy);
+			free(match);
+			free(upstream);
+			free(remote);
+			return 1;
+		}
+		*colon++ = '\0';
+		char *username = auth_part;
+		char *password = colon;
+		size_t ulen = strlen(username);
+		size_t plen = strlen(password);
 		if (ulen > 255 || plen > 255) {
 			free(rule);
+			free(upstream_copy);
+			free(remote_copy);
+			free(match);
+			free(upstream);
+			free(remote);
 			return 1;
 		}
 		rule->auth_len = 1 + 1 + ulen + 1 + plen;
 		rule->auth_buf = malloc(rule->auth_len);
 		rule->auth_buf[0] = 1;
 		rule->auth_buf[1] = ulen;
-		memcpy(&rule->auth_buf[2], upstream_copy, ulen);
+		memcpy(&rule->auth_buf[2], username, ulen);
 		rule->auth_buf[2 + ulen] = plen;
-		memcpy(&rule->auth_buf[3 + ulen], q, plen);
-		free(rule->upstream_name);
-		rule->upstream_name = strdup(p);
+		memcpy(&rule->auth_buf[3 + ulen], password, plen);
+		rule->upstream_name = strdup(host_part);
+		rule->upstream_port = upstream_port;
 		/* hide from ps */
 		memset(str+ncred, '*', ulen+1+plen);
+	} else {
+		rule->upstream_name = strdup(upstream_copy);
+		rule->upstream_port = upstream_port;
 	}
 
-	short rlen = strlen(remote);
+	free(upstream_copy);
+	short rlen = strlen(remote_copy);
 	rule->req_len = 3 + 1 + 1 + rlen + 2;
 	rule->req_buf = (char*)malloc(rule->req_len);
 	rule->req_buf[0] = 5;
@@ -617,12 +652,15 @@ static int fwd_rules_add(char *str) {
 	rule->req_buf[2] = 0;
 	rule->req_buf[3] = 3;
 	rule->req_buf[4] = rlen;
-	memcpy(&rule->req_buf[5], remote, rlen);
+	memcpy(&rule->req_buf[5], remote_copy, rlen);
 	unsigned short rport = remote_port ? remote_port : 0;
 	rule->req_buf[5 + rlen]     = (rport >> 8) & 0xFF;
 	rule->req_buf[5 + rlen + 1] = (rport & 0xFF);
-	rule->match_port = match_port;
+	free(remote_copy);
 	sblist_add(fwd_rules, rule);
+	free(match);
+	free(upstream);
+	free(remote);
 
 	return 0;
 }
