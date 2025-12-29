@@ -482,6 +482,7 @@ static int handshake(struct thread *t) {
 	ssize_t n;
 	int ret;
 	enum authmethod am;
+	int used_rule = 0;
 	t->state = SS_1_CONNECTED;
 	while((n = recv(t->client.fd, buf, sizeof buf, 0)) > 0) {
 		switch(t->state) {
@@ -505,7 +506,6 @@ static int handshake(struct thread *t) {
 				}
 				break;
 			case SS_3_AUTHED:
-				int used_rule = 0;
 				ret = connect_socks_target(buf, n, &t->client, &used_rule);
 				if(ret < 0) {
 					send_error(t->client.fd, ret*-1);
