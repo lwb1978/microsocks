@@ -10,6 +10,7 @@
 .It Nm
 .Op Fl 1q
 .Op Fl b Ar ip
+.Op Fl h Ar httpport
 .Op Fl i Ar addr
 .Op Fl P Ar pass
 .Op Fl p Ar port
@@ -49,6 +50,18 @@ and
 also to be specified.
 .It Fl b Ar ip
 Specifies IP address outgoing connections are bound to.
+.It Fl h Ar httpport
+Enable an additional HTTP proxy listener on
+.Ar httpport ,
+using the same listening address as the SOCKS5 listener.
+Without this option, the HTTP listener is disabled.
+HTTP/1.x requests and CONNECT tunnels are supported.
+The HTTP listener shares credentials, IP whitelists, one-time authentication
+results, outgoing bind address, forwarding rules, logging, and idle timeout
+with the SOCKS5 listener.
+HTTP authentication uses Basic proxy authentication.
+Ordinary HTTP connections can carry multiple requests; each request is
+authenticated and routed independently.
 .It Fl i Ar addr
 Specifies local address to listen connections on. Host name or IP address can be
 supplied. Default to
@@ -89,6 +102,11 @@ Require authentication for all except two specified hosts.
 Listen on port 8080 and use 46.62.90.74 as a source IP for external connections.
 .Pp
 .Dl $ microsocks -i 0.0.0.0 -b 46.62.90.74 -p 8080
+.Pp
+Enable SOCKS5 on port 1080 and an HTTP proxy on port 8080.
+.Pp
+.Dl $ microsocks -p 1080 -h 8080 -u user -P secret
+.Dl $ curl --proxy http://127.0.0.1:8080 --proxy-user user:secret https://example.com/
 .Pp
 Connect to
 .Lk https://freebsd.org

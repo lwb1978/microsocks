@@ -52,12 +52,14 @@ prefix: do so in config.mak:
 command line options
 --------------------
 
-    microsocks -1 -q -t timeout -i listenip -p port -u user -P passw -b bindaddr -w wl
+    microsocks -1 -q -t timeout -i listenip -p port -h httpport -u user -P passw -b bindaddr -w wl -f fwdrule
 
 ```
 all arguments are optional.
 by default listenip is 0.0.0.0 and port 1080.
 
+-h httpport enables an additional HTTP proxy listener on the same listenip.
+   without -h, only the SOCKS5 listener is enabled.
 -q disables logging.
 -b specifies which ip outgoing connections are bound to
 -t timeout is specified in seconds, default 0.
@@ -84,6 +86,48 @@ Supported SOCKS5 Features
 - authentication: none, password, one-time
 - IPv4, IPv6, DNS
 - TCP (no UDP at this time)
+
+HTTP gateway
+------------
+
+The gateway variant adds an optional HTTP/1.0 and HTTP/1.1 forward proxy.
+The SOCKS5 listener remains available at the same time:
+
+    microsocks -i 127.0.0.1 -p 1080 -h 8080 -u user -P password
+
+Both listeners share `-u`/`-P` credentials, `-w` whitelists, `-1` authentication
+results, `-b` outgoing bind address, `-f` forwarding rules, `-t` idle timeout,
+and `-q` logging settings. With `-1`, successful authentication on either
+listener allows that client IP to use both listeners without authentication.
+HTTP uses Basic proxy authentication and returns 407 when authentication is
+required.
+
+    curl --proxy http://127.0.0.1:8080 --proxy-user user:password http://example.com/
+    curl --proxy http://127.0.0.1:8080 --proxy-user user:password https://example.com/
+
+HTTPS destinations use CONNECT tunnels. Ordinary HTTP requests support
+persistent client connections, sequential pipelined requests, Content-Length,
+chunked bodies and trailers, and Expect: 100-continue. Each request is checked
+for authentication and routed independently. Connections to the same target
+are reused when possible; a later request on the same client connection may
+also use a different target or forwarding rule. Close-delimited responses
+close the client connection after the response body.
+
+Forwarding rules have the format:
+
+    -f 'match_name:match_port,[user:password@]upstream_name:upstream_port,remote_name:remote_port'
+
+The first matching rule wins. `*` or `0.0.0.0` matches any host, match port 0
+matches any port, and remote port 0 preserves the requested port. Rules route
+connections through an upstream SOCKS5 proxy. HTTP Host and tunneled TLS
+traffic retain the client's original destination name.
+
+The HTTP listener accepts plaintext HTTP/1.x; TLS to the proxy itself and
+ordinary HTTP Upgrade requests are not implemented. HTTPS traffic can still
+pass through CONNECT. The supported transfer coding is chunked. Headers are
+limited to approximately 16 KiB and 128 fields; individual chunk-size and
+trailer lines are limited to 1023 bytes. HTTP buffers are allocated on the
+heap to preserve the small thread stack.
 
 Troubleshooting
 ---------------

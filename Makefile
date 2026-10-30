@@ -5,7 +5,7 @@ prefix = /usr/local
 bindir = $(prefix)/bin
 
 PROG = microsocks
-SRCS =  sockssrv.c server.c sblist.c sblist_delete.c
+SRCS =  sockssrv.c httpproxy.c server.c sblist.c sblist_delete.c
 OBJS = $(SRCS:.c=.o)
 
 LIBS = -lpthread
@@ -17,6 +17,8 @@ INSTALL = ./install.sh
 -include config.mak
 
 all: $(PROG)
+
+sockssrv.o httpproxy.o: httpproxy.h
 
 install: $(PROG)
 	$(INSTALL) -D -m 755 $(PROG) $(DESTDIR)$(bindir)/$(PROG)

@@ -1,3 +1,9 @@
 *.o
 *.out
+/microsocks
+/microsocks.exe
+/microsocks-gateway.exe
+*.su
+*.pyc
+__pycache__/
 

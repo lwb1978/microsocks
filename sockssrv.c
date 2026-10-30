@@ -36,7 +36,8 @@
 #include <sys/time.h>
 #include "server.h"
 #include "sblist.h"
-#define MICROSOCKS_VERSION "1.0.5-forward"
+#include "httpproxy.h"
+#define MICROSOCKS_VERSION "1.0.5-gateway"
 
 /* timeout in microseconds on resource exhaustion to prevent excessive
    cpu usage. */
@@ -114,6 +115,7 @@ struct fwd_rule {
 struct thread {
 	pthread_t pt;
 	struct client client;
+	int http;
 	enum socksstate state;
 	volatile int  done;
 };
@@ -200,7 +202,7 @@ static int upstream_handshake(const struct fwd_rule *rule, int client_fd,
 	if(fwd_read_all(upstream_fd, buf + total, remaining) ||
 	   setsockopt(upstream_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) ||
 	   setsockopt(upstream_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) ||
-	   fwd_write_all(client_fd, buf, total + remaining))
+	   (client_fd >= 0 && fwd_write_all(client_fd, buf, total + remaining)))
 		return -EC_GENERAL_FAILURE;
 	return upstream_fd;
 }
@@ -214,7 +216,7 @@ static struct addrinfo* addr_choose(struct addrinfo* list, union sockaddr_union*
 	return list;
 }
 
-static int connect_socks_target(unsigned char *buf, size_t n, struct client *client, int *used_rule) {
+static int connect_socks_target(unsigned char *buf, size_t n, struct client *client, int *used_rule, int send_reply) {
 	*used_rule = 0;
 
 	if(n < 5) return -EC_GENERAL_FAILURE;
@@ -328,7 +330,7 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
 	}
 
 	if (rule) {
-		int result = upstream_handshake(rule, client->fd, fd, original_port,
+		int result = upstream_handshake(rule, send_reply ? client->fd : -1, fd, original_port,
 			buf + minlen, n - minlen);
 		if(result < 0) {
 			close(fd);
@@ -479,7 +481,7 @@ static int handshake(struct thread *t) {
 				}
 				break;
 			case SS_3_AUTHED:
-				ret = connect_socks_target(buf, n, &t->client, &used_rule);
+				ret = connect_socks_target(buf, n, &t->client, &used_rule, 1);
 				if(ret < 0) {
 					send_error(t->client.fd, ret*-1);
 					return -1;
@@ -493,12 +495,53 @@ static int handshake(struct thread *t) {
 	return -1;
 }
 
+/* HTTP shares the same credentials, whitelist, and outgoing routing. */
+static int http_authorize(struct client *client, const unsigned char *credentials, size_t len) {
+	int authed = !auth_user;
+	if(!authed && auth_ips && !pthread_rwlock_rdlock(&auth_ips_lock)) {
+		authed = is_in_authed_list(&client->addr);
+		pthread_rwlock_unlock(&auth_ips_lock);
+	}
+	if(authed) return 1;
+	size_t ulen = strlen(auth_user), plen = strlen(auth_pass);
+	if(!credentials || len != ulen + 1 + plen ||
+	   memcmp(credentials, auth_user, ulen) || credentials[ulen] != ':' ||
+	   memcmp(credentials + ulen + 1, auth_pass, plen)) return 0;
+	if(auth_ips && !pthread_rwlock_wrlock(&auth_ips_lock)) {
+		if(!is_in_authed_list(&client->addr)) add_auth_ip(&client->addr);
+		pthread_rwlock_unlock(&auth_ips_lock);
+	}
+	return 1;
+}
+
+static int http_connect_target(struct client *client, const char *host, unsigned short port) {
+	unsigned char request[262] = {5, 1, 0, 3};
+	size_t len = strlen(host);
+	int used_rule, fd;
+	if(!len || len > 255) return -502;
+	request[4] = len;
+	memcpy(request + 5, host, len);
+	request[5 + len] = port >> 8;
+	request[6 + len] = port & 0xff;
+	fd = connect_socks_target(request, 7 + len, client, &used_rule, 0);
+	return fd == -EC_TTL_EXPIRED ? -504 : fd < 0 ? -502 : fd;
+}
+
+static struct http_proxy_config http_config = {
+	.authorize = http_authorize,
+	.connect_target = http_connect_target,
+	.tunnel = copyloop,
+};
+
 static void* clientthread(void *data) {
 	struct thread *t = data;
-	int remotefd = handshake(t);
-	if(remotefd != -1) {
-		copyloop(t->client.fd, remotefd);
-		close(remotefd);
+	if(t->http) http_proxy_serve(&t->client, &http_config);
+	else {
+		int remotefd = handshake(t);
+		if(remotefd != -1) {
+			copyloop(t->client.fd, remotefd);
+			close(remotefd);
+		}
 	}
 	close(t->client.fd);
 	t->done = 1;
@@ -600,11 +643,13 @@ out:
 
 static int usage(void) {
 	dprintf(2,
-		"MicroSocks SOCKS5 Server\n"
+		"MicroSocks SOCKS5/HTTP Gateway\n"
 		"------------------------\n"
-		"usage: microsocks -1 -q -t timeout -i listenip -p port -u user -P pass -b bindaddr -w ips -f fwdrule -V\n"
+		"usage: microsocks -1 -q -t timeout -i listenip -p port -h httpport -u user -P pass -b bindaddr -w ips -f fwdrule -V\n"
 		"all arguments are optional.\n"
 		"by default listenip is 0.0.0.0 and port 1080.\n\n"
+		"-h httpport enables an additional HTTP proxy listener on the same listenip.\n"
+		"   HTTP shares authentication, whitelist, forwarding rules, and timeout settings.\n"
 		"-q disables logging.\n"
 		"-b specifies which ip outgoing connections are bound to\n"
 		"-t timeout is specified in seconds, default 0.\n"
@@ -640,8 +685,8 @@ int main(int argc, char** argv) {
 	int ch;
 	const char *listenip = "0.0.0.0";
 	char *p, *q;
-	unsigned port = 1080;
-	while((ch = getopt(argc, argv, ":1qb:t:i:p:u:P:w:f:V")) != -1) {
+	unsigned port = 1080, http_port = 0;
+	while((ch = getopt(argc, argv, ":1qb:t:i:p:h:u:P:w:f:V")) != -1) {
 		switch(ch) {
 			case 'w': /* fall-through */
 			case '1':
@@ -684,6 +729,17 @@ int main(int argc, char** argv) {
 			case 'p':
 				port = atoi(optarg);
 				break;
+			case 'h': {
+				char *end;
+				unsigned long value;
+				errno = 0;
+				value = strtoul(optarg, &end, 10);
+				if(errno || optarg[0] < '0' || optarg[0] > '9' || *end ||
+				   value == 0 || value > USHRT_MAX)
+					return dprintf(2, "error: invalid HTTP listening port\n"), 1;
+				http_port = value;
+				break;
+			}
 			case 'f':
 				if(!fwd_rules)
 					fwd_rules = sblist_new(sizeof(struct fwd_rule), 16);
@@ -709,27 +765,50 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	signal(SIGPIPE, SIG_IGN);
-	struct server s;
+	struct server s, http_server;
 	sblist *threads = sblist_new(sizeof (struct thread*), 8);
 	if(server_setup(&s, listenip, port)) {
 		perror("server_setup");
 		return 1;
 	}
 	server = &s;
-
+	if(http_port && server_setup(&http_server, listenip, http_port)) {
+		perror("HTTP server_setup");
+		close(s.fd);
+		return 1;
+	}
+	http_config.timeout = timeout;
+	int next_http = 0;
 	while(1) {
 		collect(threads);
+		int use_http = 0;
+		if(http_port) {
+			struct pollfd listeners[2] = {
+				{.fd = s.fd, .events = POLLIN},
+				{.fd = http_server.fd, .events = POLLIN},
+			};
+			if(poll(listeners, 2, -1) <= 0) {
+				if(errno != EINTR) usleep(FAILURE_TIMEOUT);
+				continue;
+			}
+			if(!(listeners[0].revents & POLLIN) && !(listeners[1].revents & POLLIN))
+				continue;
+			use_http = (listeners[1].revents & POLLIN) &&
+				(!(listeners[0].revents & POLLIN) || next_http);
+			next_http = !use_http;
+		}
 		struct client c;
 		struct thread *curr = malloc(sizeof (struct thread));
 		if(!curr) goto oom;
 		curr->done = 0;
-		if(server_waitclient(&s, &c)) {
+		if(server_waitclient(use_http ? &http_server : &s, &c)) {
 			dolog("failed to accept connection\n");
 			free(curr);
 			usleep(FAILURE_TIMEOUT);
 			continue;
 		}
 		curr->client = c;
+		curr->http = use_http;
 		if(!sblist_add(threads, &curr)) {
 			close(curr->client.fd);
 			free(curr);
