@@ -66,7 +66,7 @@
 #define THREAD_STACK_SIZE 32*1024
 #endif
 
-static int quiet;
+static int quiet, timeout;
 static const char* auth_user;
 static const char* auth_pass;
 static sblist* auth_ips;
@@ -102,11 +102,11 @@ enum errorcode {
 
 struct fwd_rule {
 	char *match_name;
-	short match_port;
+	unsigned short match_port;
 	char *auth_buf; /* Username/Password request buffer (RFC-1929) */
 	size_t auth_len;
 	char *upstream_name;
-	short upstream_port;
+	unsigned short upstream_port;
 	char *req_buf; /* Client Connection Request buffer to send to upstream */
 	size_t req_len;
 };
@@ -130,106 +130,78 @@ struct thread {
 static void dolog(const char* fmt, ...) { }
 #endif
 
-static int upstream_handshake(const struct fwd_rule* rule, unsigned char *client_buf, size_t client_buf_len, 
-							int client_fd, int upstream_fd, unsigned short client_port) {
-	unsigned char sbuf[512];
-	ssize_t r;
+static int fwd_read_all(int fd, unsigned char *buf, size_t len) {
+	while(len) {
+		ssize_t n = read(fd, buf, len);
+		if(n < 0 && errno == EINTR) continue;
+		if(n <= 0) return -1;
+		buf += n;
+		len -= n;
+	}
+	return 0;
+}
 
-	if(rule->auth_buf) {
-		unsigned char handshake[4] = {5, 2, 0, 2};
-		if (write(upstream_fd, handshake, 4) != 4) {
-			close(upstream_fd);
-			return -1;
-		}
-	} else {
-		unsigned char handshake[3] = {5, 1, 0};
-		if (write(upstream_fd, handshake, 3) != 3) {
-			close(upstream_fd);
-			return -1;
-		}
+static int fwd_write_all(int fd, const unsigned char *buf, size_t len) {
+	while(len) {
+		ssize_t n = write(fd, buf, len);
+		if(n < 0 && errno == EINTR) continue;
+		if(n <= 0) return -1;
+		buf += n;
+		len -= n;
+	}
+	return 0;
+}
+
+/* The caller owns upstream_fd, including on failure. */
+static int upstream_handshake(const struct fwd_rule *rule, int client_fd,
+		int upstream_fd, unsigned short client_port,
+		const unsigned char *payload, size_t payload_len) {
+	unsigned char buf[262]; /* largest SOCKS5 domain-name request/reply */
+	unsigned char greeting[] = {5, 1, AM_NO_AUTH, AM_USERNAME};
+	size_t total = 4, remaining;
+	struct timeval tv = {0, 0};
+	if(rule->auth_buf) greeting[1] = 2;
+	if(fwd_write_all(upstream_fd, greeting, 2 + greeting[1]) ||
+	   fwd_read_all(upstream_fd, buf, 2) || buf[0] != 5)
+		return -EC_GENERAL_FAILURE;
+
+	if(buf[1] == AM_USERNAME && rule->auth_buf) {
+		if(fwd_write_all(upstream_fd, (unsigned char *)rule->auth_buf, rule->auth_len) ||
+		   fwd_read_all(upstream_fd, buf, 2) || buf[0] != 1)
+			return -EC_GENERAL_FAILURE;
+		if(buf[1] != 0) return -EC_NOT_ALLOWED;
+	} else if(buf[1] != AM_NO_AUTH) {
+		return -EC_NOT_ALLOWED;
 	}
 
-	if (read(upstream_fd, sbuf, 2) != 2 || sbuf[0] != 5) {
-		close(upstream_fd);
-		return -1;
+	/* Rules are shared by all client threads; patch a private request copy. */
+	memcpy(buf, rule->req_buf, rule->req_len);
+	if(buf[rule->req_len-2] == 0 && buf[rule->req_len-1] == 0) {
+		buf[rule->req_len-2] = client_port >> 8;
+		buf[rule->req_len-1] = client_port & 0xff;
 	}
+	if(fwd_write_all(upstream_fd, buf, rule->req_len) ||
+	   fwd_write_all(upstream_fd, payload, payload_len) ||
+	   fwd_read_all(upstream_fd, buf, total) || buf[0] != 5 || buf[2] != 0)
+		return -EC_GENERAL_FAILURE;
+	if(buf[1] != EC_SUCCESS)
+		return -(buf[1] <= EC_ADDRESSTYPE_NOT_SUPPORTED ? buf[1] : EC_GENERAL_FAILURE);
 
-	if (sbuf[1] == 2) {
-		if (!rule->auth_buf) {
-			close(upstream_fd);
-			return -1;
-		}
-		if (write(upstream_fd, rule->auth_buf, rule->auth_len) != (ssize_t)rule->auth_len) {
-			close(upstream_fd);
-			return -1;
-		}
-		if (read(upstream_fd, sbuf, 2) != 2 || sbuf[0] != 1 || sbuf[1] != 0) {
-			close(upstream_fd);
-			return -1;
-		}
-	} else if (sbuf[1] != 0) {
-		close(upstream_fd);
-		return -1;
-	}
-
-	if (write(upstream_fd, client_buf, client_buf_len) != (ssize_t)client_buf_len) {
-		close(upstream_fd);
-		return -1;
-	}
-
-	size_t total = 0;
-	size_t need = 4;
-
-	while (total < need) {
-		r = read(upstream_fd, sbuf + total, need - total);
-		if (r <= 0) {
-			close(upstream_fd);
-			return -1;
-		}
-		total += r;
-	}
-
-	if (sbuf[1] != 0) {
-		close(upstream_fd);
-		return -sbuf[1];
-	}
-
-	size_t need_more = 0;
-	switch (sbuf[3]) {
-		case 1:
-			need_more = 4 + 2;
-			break;
-		case 4:
-			need_more = 16 + 2;
-			break;
+	switch(buf[3]) {
+		case 1: remaining = 4 + 2; break;
+		case 4: remaining = 16 + 2; break;
 		case 3:
-			r = read(upstream_fd, sbuf + total, 1);
-			if (r != 1) {
-				close(upstream_fd);
-				return -1;
-			}
-			total += r;
-			need_more = sbuf[4] + 2;
+			if(fwd_read_all(upstream_fd, buf + total, 1) || !buf[total])
+				return -EC_GENERAL_FAILURE;
+			remaining = buf[total++] + 2;
 			break;
-		default:
-			close(upstream_fd);
-			return -EC_ADDRESSTYPE_NOT_SUPPORTED;
+		default: return -EC_ADDRESSTYPE_NOT_SUPPORTED;
 	}
-
-	while (total < need + need_more) {
-		r = read(upstream_fd, sbuf + total, (need + need_more) - total);
-		if (r <= 0) {
-			close(upstream_fd);
-			return -1;
-		}
-		total += r;
-	}
-
-	if (write(client_fd, sbuf, total) != (ssize_t)total) {
-		close(upstream_fd);
-		return -1;
-	}
-
+	if(fwd_read_all(upstream_fd, buf + total, remaining) ||
+	   setsockopt(upstream_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) ||
+	   setsockopt(upstream_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) ||
+	   fwd_write_all(client_fd, buf, total + remaining))
+		return -EC_GENERAL_FAILURE;
 	return upstream_fd;
 }
 
@@ -329,9 +301,12 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
 		}
 	}
 
-	struct timeval tv = {5, 0};
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+	if(rule) {
+		struct timeval tv = {5, 0};
+		if(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) ||
+		   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv))
+			goto eval_errno;
+	}
 
 	if(SOCKADDR_UNION_AF(&bind_addr) == raddr->ai_family &&
 	   bindtoip(fd, &bind_addr) == -1)
@@ -353,14 +328,15 @@ static int connect_socks_target(unsigned char *buf, size_t n, struct client *cli
 	}
 
 	if (rule) {
-		int result = upstream_handshake(rule, buf, n, client->fd, fd, original_port);
-		if (result < 0) {
+		int result = upstream_handshake(rule, client->fd, fd, original_port,
+			buf + minlen, n - minlen);
+		if(result < 0) {
 			close(fd);
 			return result;
 		}
 		return result;
 	}
-    return fd;
+	return fd;
 }
 
 static int is_authed(union sockaddr_union *client, union sockaddr_union *authedip) {
@@ -433,10 +409,7 @@ static void copyloop(int fd1, int fd2) {
 	};
 
 	while(1) {
-		/* inactive connections are reaped after 15 min to free resources.
-		   usually programs send keep-alive packets so this should only happen
-		   when a connection is really unused. */
-		switch(poll(fds, 2, 60*15*1000)) {
+		switch(poll(fds, 2, timeout ? timeout*1000 : -1)) {
 			case 0:
 				return;
 			case -1:
@@ -545,151 +518,114 @@ static void collect(sblist *threads) {
 	}
 }
 
-static short host_get_port(char *name) {
-	int p,n;
-	char *c;
-	if((c = strrchr(name, ':')) && sscanf(c+1,"%d%n",&p, &n)==1 && n == (int)(strlen(c + 1)) && p >= 0 && p < USHRT_MAX)
-		return (*c='\0'),(short)p;
-	else
-		return -1;
+static int host_get_port(char *name) {
+	char *c = strrchr(name, ':'), *end;
+	unsigned long port;
+	if(!c || c[1] < '0' || c[1] > '9') return -1;
+	errno = 0;
+	port = strtoul(c+1, &end, 10);
+	if(errno || *end || port > USHRT_MAX) return -1;
+	*c = 0;
+	return (int)port;
 }
 
 static int fwd_rules_add(char *str) {
-	char *match = NULL, *upstream = NULL, *remote = NULL;
-	unsigned short match_port, upstream_port, remote_port;
-	int ncred;
-
-	if(sscanf(str, "%m[^,],%n%m[^,],%ms\n", &match, &ncred, &upstream, &remote) != 3)
-		return 1;
+	struct fwd_rule rule = {0};
+	char *storage = strdup(str), *match, *upstream, *remote, *at, *colon;
+	int match_port, upstream_port, remote_port;
+	size_t rlen, ulen, plen;
+	int result = 1;
+	if(!storage) return 1;
+	match = storage;
+	if(!(upstream = strchr(match, ','))) goto out;
+	*upstream++ = 0;
+	if(!(remote = strchr(upstream, ','))) goto out;
+	*remote++ = 0;
+	if(strchr(remote, ',')) goto out;
 
 	match_port = host_get_port(match);
 	upstream_port = host_get_port(upstream);
 	remote_port = host_get_port(remote);
+	if(match_port < 0 || upstream_port <= 0 || remote_port < 0) goto out;
+	rlen = strlen(remote);
+	if(!rlen || rlen > 255) goto out;
 
-	if(match_port < 0 || upstream_port <= 0 || remote_port < 0) {
-		free(match);
-		free(upstream);
-		free(remote);
-		return 1;
+	if(!strcmp(match, "0.0.0.0") || !strcmp(match, "*")) match[0] = 0;
+	rule.match_name = strdup(match);
+	rule.match_port = match_port;
+	rule.upstream_port = upstream_port;
+	if((at = strrchr(upstream, '@'))) {
+		*at = 0;
+		if(!(colon = strchr(upstream, ':'))) goto out;
+		*colon++ = 0;
+		ulen = strlen(upstream);
+		plen = strlen(colon);
+		if(!ulen || ulen > 255 || !plen || plen > 255) goto out;
+		rule.auth_len = 3 + ulen + plen;
+		if(!(rule.auth_buf = malloc(rule.auth_len))) goto out;
+		rule.auth_buf[0] = 1;
+		rule.auth_buf[1] = ulen;
+		memcpy(rule.auth_buf + 2, upstream, ulen);
+		rule.auth_buf[2 + ulen] = plen;
+		memcpy(rule.auth_buf + 3 + ulen, colon, plen);
+		/* Hide credentials in the original argument, not just the copy. */
+		memset(str + (upstream - storage), '*', at - upstream);
+		upstream = at + 1;
 	}
-
-	char *match_copy = strdup(match);
-	char *upstream_copy = strdup(upstream);
-	char *remote_copy = strdup(remote);
-
-	struct fwd_rule *rule = (struct fwd_rule*)malloc(sizeof(struct fwd_rule));
-	if (!rule) {
-		free(match_copy);
-		free(upstream_copy);
-		free(remote_copy);
-		free(match);
-		free(upstream);
-		free(remote);
-		return 1;
+	if(!*upstream || strlen(upstream) > 255) goto out;
+	rule.upstream_name = strdup(upstream);
+	rule.req_len = 7 + rlen;
+	if(!rule.match_name || !rule.upstream_name ||
+	   !(rule.req_buf = malloc(rule.req_len))) goto out;
+	rule.req_buf[0] = 5;
+	rule.req_buf[1] = 1;
+	rule.req_buf[2] = 0;
+	rule.req_buf[3] = 3;
+	rule.req_buf[4] = rlen;
+	memcpy(rule.req_buf + 5, remote, rlen);
+	rule.req_buf[5 + rlen] = remote_port >> 8;
+	rule.req_buf[6 + rlen] = remote_port & 0xff;
+	if(!sblist_add(fwd_rules, &rule)) goto out;
+	result = 0;
+out:
+	if(result) {
+		free(rule.match_name);
+		free(rule.auth_buf);
+		free(rule.upstream_name);
+		free(rule.req_buf);
 	}
-
-	if(strcmp(match_copy, "0.0.0.0") == 0 || strcmp(match_copy, "*") == 0) {
-		free(match_copy);
-		rule->match_name = strdup("");
-	} else {
-		rule->match_name = match_copy;
-	}
-	rule->match_port = match_port;
-	rule->auth_buf = NULL;
-	rule->auth_len = 0;
-
-	char *at_sign = strchr(upstream_copy, '@');
-	if (at_sign) {
-		*at_sign = '\0';
-		char *auth_part = upstream_copy;
-		char *host_part = at_sign + 1;
-		char *colon = strchr(auth_part, ':');
-		if (!colon) {
-			free(rule);
-			free(upstream_copy);
-			free(remote_copy);
-			free(match);
-			free(upstream);
-			free(remote);
-			return 1;
-		}
-		*colon++ = '\0';
-		char *username = auth_part;
-		char *password = colon;
-		size_t ulen = strlen(username);
-		size_t plen = strlen(password);
-		if (ulen > 255 || plen > 255) {
-			free(rule);
-			free(upstream_copy);
-			free(remote_copy);
-			free(match);
-			free(upstream);
-			free(remote);
-			return 1;
-		}
-		rule->auth_len = 1 + 1 + ulen + 1 + plen;
-		rule->auth_buf = malloc(rule->auth_len);
-		rule->auth_buf[0] = 1;
-		rule->auth_buf[1] = ulen;
-		memcpy(&rule->auth_buf[2], username, ulen);
-		rule->auth_buf[2 + ulen] = plen;
-		memcpy(&rule->auth_buf[3 + ulen], password, plen);
-		rule->upstream_name = strdup(host_part);
-		rule->upstream_port = upstream_port;
-		/* hide from ps */
-		memset(str+ncred, '*', ulen+1+plen);
-	} else {
-		rule->upstream_name = strdup(upstream_copy);
-		rule->upstream_port = upstream_port;
-	}
-
-	free(upstream_copy);
-	short rlen = strlen(remote_copy);
-	rule->req_len = 3 + 1 + 1 + rlen + 2;
-	rule->req_buf = (char*)malloc(rule->req_len);
-	rule->req_buf[0] = 5;
-	rule->req_buf[1] = 1;
-	rule->req_buf[2] = 0;
-	rule->req_buf[3] = 3;
-	rule->req_buf[4] = rlen;
-	memcpy(&rule->req_buf[5], remote_copy, rlen);
-	unsigned short rport = remote_port ? remote_port : 0;
-	rule->req_buf[5 + rlen]     = (rport >> 8) & 0xFF;
-	rule->req_buf[5 + rlen + 1] = (rport & 0xFF);
-	free(remote_copy);
-	sblist_add(fwd_rules, rule);
-	free(match);
-	free(upstream);
-	free(remote);
-
-	return 0;
+	free(storage);
+	return result;
 }
 
 static int usage(void) {
 	dprintf(2,
 		"MicroSocks SOCKS5 Server\n"
 		"------------------------\n"
-		"usage: microsocks -1 -q -i listenip -p port -u user -P pass -b bindaddr -w ips -f fwdrule\n"
+		"usage: microsocks -1 -q -t timeout -i listenip -p port -u user -P pass -b bindaddr -w ips -f fwdrule -V\n"
 		"all arguments are optional.\n"
 		"by default listenip is 0.0.0.0 and port 1080.\n\n"
-		"option -q disables logging.\n"
-		"option -b specifies which ip outgoing connections are bound to\n"
-		"option -w allows to specify a comma-separated whitelist of ip addresses,\n"
-		" that may use the proxy without user/pass authentication.\n"
-		" e.g. -w 127.0.0.1,192.168.1.1.1,::1 or just -w 10.0.0.1\n"
-		" to allow access ONLY to those ips, choose an impossible to guess user/pw combo.\n"
-		"option -1 activates auth_once mode: once a specific ip address\n"
-		" authed successfully with user/pass, it is added to a whitelist\n"
-		" and may use the proxy without auth.\n"
-		" this is handy for programs like firefox that don't support\n"
-		" user/pass auth. for it to work you'd basically make one connection\n"
-		" with another program that supports it, and then you can use firefox too.\n"
-		"option -f specifies a forwarding rule of the form\n"
-		"  match_name:match_port,[user:password@]upstream_name:upstream_port,remote_name:remote_port\n"
-		" this will cause requests that /match/ to be renamed to /remote/\n"
-		" and sent to the /upstream/ SOCKS5 proxy server.\n"
-		" this option may be specified multiple times.\n"
-		"option -V prints version information and exits.\n"
+		"-q disables logging.\n"
+		"-b specifies which ip outgoing connections are bound to\n"
+		"-t timeout is specified in seconds, default 0.\n"
+		"   if timeout is set to 0, block until the OS signals activity.\n"
+		"-w allows to specify a comma-separated whitelist of ip addresses,\n"
+		"   that may use the proxy without user/pass authentication.\n"
+		"   e.g. -w 127.0.0.1,192.168.1.1,::1 or just -w 10.0.0.1\n"
+		"   to allow access ONLY to those ips, choose impossible to guess user/pw combo.\n"
+		"-1 activates auth_once mode: once a specific ip address\n"
+		"   authed successfully with user/pass, it is added to a whitelist\n"
+		"   and may use the proxy without auth.\n"
+		"   this is handy for programs like firefox that don't support\n"
+		"   user/pass auth. for it to work you'd basically make one connection\n"
+		"   with another program that supports it, and then you can use firefox too.\n"
+		"-f specifies a forwarding rule of the form\n"
+		"   match_name:match_port,[user:password@]upstream_name:upstream_port,remote_name:remote_port\n"
+		"   matching requests are renamed to remote and sent through the upstream SOCKS5 proxy.\n"
+		"   match_name * or 0.0.0.0 matches any host; match_port 0 matches any port.\n"
+		"   remote_port 0 keeps the requested port. The first matching rule wins.\n"
+		"   this option may be specified multiple times.\n"
+		"-V prints version information and exits.\n"
 	);
 	return 1;
 }
@@ -705,7 +641,7 @@ int main(int argc, char** argv) {
 	const char *listenip = "0.0.0.0";
 	char *p, *q;
 	unsigned port = 1080;
-	while((ch = getopt(argc, argv, ":1qb:i:p:u:P:w:f:V")) != -1) {
+	while((ch = getopt(argc, argv, ":1qb:t:i:p:u:P:w:f:V")) != -1) {
 		switch(ch) {
 			case 'w': /* fall-through */
 			case '1':
@@ -728,6 +664,9 @@ int main(int argc, char** argv) {
 			case 'q':
 				quiet = 1;
 				break;
+			case 't':
+				timeout = atoi(optarg);
+				break;
 			case 'b':
 				resolve_sa(optarg, 0, &bind_addr);
 				break;
@@ -748,8 +687,8 @@ int main(int argc, char** argv) {
 			case 'f':
 				if(!fwd_rules)
 					fwd_rules = sblist_new(sizeof(struct fwd_rule), 16);
-				if(fwd_rules_add(optarg))
-					return dprintf(2, "error: could not parse forwarding rule %s\n", optarg), 1;
+				if(!fwd_rules || fwd_rules_add(optarg))
+					return dprintf(2, "error: invalid forwarding rule or out of memory\n"), 1;
 				break;
 			case ':':
 				dprintf(2, "error: option -%c requires an operand\n", optopt);
@@ -804,8 +743,13 @@ int main(int argc, char** argv) {
 			a = &attr;
 			pthread_attr_setstacksize(a, THREAD_STACK_SIZE);
 		}
-		if(pthread_create(&curr->pt, a, clientthread, curr) != 0)
+		if(pthread_create(&curr->pt, a, clientthread, curr) != 0) {
+			sblist_delete(threads, sblist_getsize(threads)-1);
+			close(curr->client.fd);
+			free(curr);
 			dolog("pthread_create failed. OOM?\n");
+			usleep(FAILURE_TIMEOUT);
+		}
 		if(a) pthread_attr_destroy(&attr);
 	}
 }
